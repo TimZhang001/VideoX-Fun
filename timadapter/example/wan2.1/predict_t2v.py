@@ -18,10 +18,10 @@ for project_root in project_roots:
 sys.path.append("/mnt/vision-gen-ssd/zhangss/VideoX-Fun")
 
 from videox_fun.dist import set_multi_gpus_devices
-from videox_fun.models import (AutoencoderKLWan, CLIPModel, WanT5EncoderModel,
+from videox_fun.models import (AutoencoderKLWan, WanT5EncoderModel, AutoTokenizer,
                               WanTransformer3DModel)
 from videox_fun.models.cache_utils import get_teacache_coefficients
-from videox_fun.pipeline import WanFunInpaintPipeline
+from videox_fun.pipeline import WanPipeline
 from videox_fun.utils.fp8_optimization import (convert_model_weight_to_float8, replace_parameters_by_name,
                                               convert_weight_dtype_wrapper)
 from videox_fun.utils.lora_utils import merge_lora, unmerge_lora
@@ -56,7 +56,7 @@ def parse_args():
     
     # 模型路径
     parser.add_argument("--config_path", type=str, default="config/wan2.1/wan_civitai.yaml", help="配置文件路径")
-    parser.add_argument("--model_name",  type=str, default="models/Diffusion_Transformer/Wan2.1-Fun-1.3B-InP", help="主模型路径")
+    parser.add_argument("--model_name",  type=str, default="models/Diffusion_Transformer/Wan2.1-T2V-1.3B", help="主模型路径")
     parser.add_argument("--transformer_path", type=str, default=None, help="Transformer检查点路径")
     parser.add_argument("--vae_path",    type=str, default=None, help="VAE检查点路径")
     parser.add_argument("--lora_path",   type=str, default=None, help="LoRA模型路径")
@@ -67,21 +67,16 @@ def parse_args():
     parser.add_argument("--fps",          type=int, default=16, help="输出视频帧率")
     parser.add_argument("--seed",         type=int, default=43, help="随机种子")
     parser.add_argument("--num_inference_steps", type=int, default=50, help="推理步数")
-    parser.add_argument("--lora_weight", type=float, default=0.55, help="LoRA权重")
+    parser.add_argument("--lora_weight",  type=float, default=0.55, help="LoRA权重")
     
     parser.add_argument("--prompt_path",     type=str, default="asset/prompt/chatgpt_custom_human_activity.txt", help="生成提示语")
     parser.add_argument("--negative_prompt", type=str, default="色调艳丽，过曝，静态，细节模糊不清，字幕，风格，作品，画作，画面，静止，整体发灰，最差质量，低质量，JPEG压缩残留，丑陋的，残缺的，多余的手指，画得不好的手部，画得不好的脸部，畸形的，毁容的，形态畸形的肢体，手指融合，静止不动的画面，杂乱的背景，三条腿，背景人很多，倒着走",
                        help="负面提示语")
-    parser.add_argument("--guidance_scale", type=float, default=6.0, help="指导系数")
-    
-    parser.add_argument("--validation_image_start", type=str, default=None, help="起始参考图像路径")
-    parser.add_argument("--validation_image_end",   type=str, default=None, help="结束参考图像路径")
-
-    # Choose the sampler in "Flow"
-    parser.add_argument("--sampler_name",           type=str, default="Flow", help="Choose the sampler in Flow")
+    parser.add_argument("--guidance_scale",  type=float, default=6.0, help="指导系数")
+    parser.add_argument("--sampler_name",    type=str, default="Flow", help="Choose the sampler in Flow")
     
     # 输出配置
-    parser.add_argument("--base_save_path", type=str, default="samples", help="输出基础路径")
+    parser.add_argument("--base_save_path",  type=str, default="samples", help="输出基础路径")
     
     parser.set_defaults(enable_teacache=True)
     return parser.parse_args()
@@ -90,11 +85,9 @@ def save_results(sample, save_path, video_length, fps, sample_num):
     if not os.path.exists(save_path):
         os.makedirs(save_path, exist_ok=True)
 
-    index = len([path for path in os.listdir(save_path)]) + 1
-    prefix = str(index).zfill(4)
     suffix = str(sample_num).zfill(4)
     if video_length == 1:
-        video_path = os.path.join(save_path, prefix + "_" + suffix + ".png")
+        video_path = os.path.join(save_path, suffix + ".png")
 
         image = sample[0, :, 0]
         image = image.transpose(0, 1).transpose(1, 2)
@@ -102,7 +95,7 @@ def save_results(sample, save_path, video_length, fps, sample_num):
         image = Image.fromarray(image)
         image.save(video_path)
     else:
-        video_path = os.path.join(save_path, prefix + "_" + suffix + ".mp4")
+        video_path = os.path.join(save_path, suffix + ".mp4")
         save_videos_grid(sample, video_path, fps=fps)
 
 def load_prompts(prompt_path, prompt_column="prompt", start_idx=None, end_idx=None):
@@ -175,12 +168,6 @@ def load_model(args, config, device):
     )
     text_encoder = text_encoder.eval()
 
-    # Get Clip Image Encoder
-    clip_image_encoder = CLIPModel.from_pretrained(
-        os.path.join(args.model_name, config['image_encoder_kwargs'].get('image_encoder_subpath', 'image_encoder')),
-    ).to(weight_dtype)
-    clip_image_encoder = clip_image_encoder.eval()
-
     # Get Scheduler
     Choosen_Scheduler = scheduler_dict = {
         "Flow": FlowMatchEulerDiscreteScheduler,
@@ -190,14 +177,12 @@ def load_model(args, config, device):
     )
 
     # Get Pipeline
-    pipeline = WanFunInpaintPipeline(
-        transformer=transformer,
-        vae=vae,
-        tokenizer=tokenizer,
-        text_encoder=text_encoder,
-        scheduler=scheduler,
-        clip_image_encoder=clip_image_encoder
-    )
+    pipeline = WanPipeline(transformer=transformer,
+                           vae=vae,
+                           tokenizer=tokenizer,
+                           text_encoder=text_encoder,
+                           scheduler=scheduler,)
+    
     if args.ulysses_degree > 1 or args.ring_degree > 1:
         transformer.enable_multi_gpus_inference()
 
@@ -226,26 +211,23 @@ def load_model(args, config, device):
     if args.lora_path is not None:
         pipeline = merge_lora(pipeline, args.lora_path, args.lora_weight)
 
-    return pipeline, generator, vae
+    return pipeline, generator, vae, transformer
 
 def main(args):
-    # 设备设置
-    #os.environ["CUDA_VISIBLE_DEVICES"] = str(args.device_id)
+
     device = set_multi_gpus_devices(args.ulysses_degree, args.ring_degree)
+    config = OmegaConf.load(args.config_path)
     
     # 动态生成输出路径
     if args.lora_path:
         lora_name = os.path.splitext(os.path.basename(args.lora_path))[0]
         save_path = os.path.join(args.base_save_path, lora_name)
     else:
-        save_path = os.path.join(args.base_save_path, "wan-videos-fun-i2v")
-    os.makedirs(save_path, exist_ok=True)
-    
-    # 配置加载
-    config = OmegaConf.load(args.config_path)
+        save_path = os.path.join(args.base_save_path, "wan-videos-t2v-1.3B")
+    os.makedirs(save_path, exist_ok=True)    
     
     # 模型加载
-    pipeline, generator, vae = load_model(args, config, device)
+    pipeline, generator, vae, transformer = load_model(args, config, device)
     prompt_list = load_prompts(args.prompt_path)
     
     # 实际生成逻辑（保持原有流程，将硬编码变量替换为args参数）
@@ -255,9 +237,7 @@ def main(args):
         sample_num    = 0
 
         for prompt in prompt_list:
-            input_video, input_video_mask, clip_image = get_image_to_video_latent(args.validation_image_start, args.validation_image_end, 
-                                                                                  video_length=video_length, sample_size=args.sample_size)
-
+            print("prompt is: " + prompt + "\n")
             sample = pipeline(prompt, 
                               num_frames = video_length,
                               negative_prompt = args.negative_prompt,
@@ -265,10 +245,8 @@ def main(args):
                               width       = args.sample_size[1],
                               generator   = generator,
                               guidance_scale = args.guidance_scale,
-                              num_inference_steps = args.num_inference_steps,
-                              video      = input_video,
-                              mask_video = input_video_mask,
-                              clip_image = clip_image,).videos
+                              num_inference_steps = args.num_inference_steps,).videos
+                
 
             if args.ulysses_degree * args.ring_degree > 1:
                 import torch.distributed as dist

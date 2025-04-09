@@ -1,10 +1,13 @@
-export MODEL_NAME="models/Diffusion_Transformer/Wan2.1-Fun-1.3B-InP"
+export HF_ENDPOINT="https://hf-mirror.com"
+export HF_HUB_ENABLE_HF_TRANSFER=1  # 启用加速协议
+
+export MODEL_NAME="models/Diffusion_Transformer/Wan2.1-T2V-1.3B"
 export TRAIN_PROMPT_PATH="asset/prompt/chatgpt_custom_human_activity.txt"
 # Performing validation simultaneously with training will increase time and GPU memory usage.
-# export VALIDATION_PROMPT_PATH="VideoX-Fun/asset/prompt/chatgpt_custom_actpred.txt"
+# export VALIDATION_PROMPT_PATH="MovieGenVideoBench_val.txt"
 
-export CUDA_VISIBLE_DEVICES=7
-accelerate launch --num_processes=1 --mixed_precision="bf16" timadapter/scripts/wan2.1_fun/train_reward_lora.py \
+export CUDA_VISIBLE_DEVICES=5
+accelerate launch --num_processes=1 --mixed_precision="bf16" scripts/wan2.1/train_reward_lora.py \
   --config_path="config/wan2.1/wan_civitai.yaml" \
   --pretrained_model_name_or_path=$MODEL_NAME \
   --rank=32 \
@@ -22,15 +25,15 @@ accelerate launch --num_processes=1 --mixed_precision="bf16" timadapter/scripts/
   --adam_epsilon=1e-10 \
   --max_grad_norm=0.3 \
   --prompt_path=$TRAIN_PROMPT_PATH \
-  --train_sample_height=480 \
-  --train_sample_width=832 \
+  --train_sample_height=384 \
+  --train_sample_width=672 \
   --num_inference_steps=40 \
-  --video_length=81 \
-  --num_decoded_latents=3 \
+  --video_length=41 \
+  --num_sampled_frames=4 \
   --reward_fn="HPSReward" \
   --reward_fn_kwargs='{"version": "v2.1"}' \
   --backprop_strategy "tail" \
-  --backprop_num_steps 3 \
+  --backprop_num_steps 8 \
   --backprop \
   --report_to wandb 
-  #--vae_gradient_checkpointing 
+  #--vae_gradient_checkpointing \

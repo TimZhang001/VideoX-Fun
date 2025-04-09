@@ -1117,12 +1117,14 @@ def main():
         disable=not accelerator.is_local_main_process,
     )
 
+    # -------------------------------------- epoch --------------------------------------------------
     for epoch in range(first_epoch, args.num_train_epochs):
         train_loss = 0.0
         train_reward = 0.0
 
         # In the following training loop, randomly select training prompts and use the 
         # `EasyAnimatePipelineInpaint` to sample videos, calculate rewards, and update the network.
+        # ------------------------------------- step ---------------------------------------------
         for _ in range(num_update_steps_per_epoch):
             # train_prompt = random.sample(prompt_list, args.train_batch_size)
             train_prompt = random.choices(prompt_list, k=args.train_batch_size)
@@ -1181,6 +1183,8 @@ def main():
             ]
 
             with accelerator.accumulate(transformer3d):
+                
+                # ------------------- 在latent空间设定noise -------------------
                 latents = torch.randn(*latent_shape, device=accelerator.device, dtype=weight_dtype)
 
                 if hasattr(noise_scheduler, "init_noise_sigma"):
@@ -1198,17 +1202,25 @@ def main():
                     target_shape[1]
                 )
 
-                # Denoising loop
+                # Denoising loop 选择需要进行Reward计算的DeNoise步数 ----------------------------------
                 if args.backprop:
                     if args.backprop_step_list is None:
+
+                        # 选择最后一步的结果
                         if args.backprop_strategy == "last":
                             backprop_step_list = [args.num_inference_steps - 1]
+                        
+                        # 选择最后的backprop_num_steps个
                         elif args.backprop_strategy == "tail":
                             backprop_step_list = list(range(args.num_inference_steps))[-args.backprop_num_steps:]
+                        
+                        # 从0, num_inference_steps 均匀的选择backprop_num_steps个
                         elif args.backprop_strategy == "uniform":
                             interval = args.num_inference_steps // args.backprop_num_steps
                             random_start = random.randint(0, interval)
                             backprop_step_list = [random_start + i * interval for i in range(args.backprop_num_steps)]
+                        
+                        # 从backprop_random_start_step 到 backprop_random_end_step随机选择backprop_num_steps个
                         elif args.backprop_strategy == "random":
                             backprop_step_list = random.sample(
                                 range(args.backprop_random_start_step, args.backprop_random_end_step + 1), args.backprop_num_steps
@@ -1218,6 +1230,7 @@ def main():
                     else:
                         backprop_step_list = args.backprop_step_list
                 
+                # ------------------------------------------------------------------------------------------
                 for i, t in enumerate(tqdm(timesteps)):
                     # expand the latents if we are doing classifier free guidance
                     latent_model_input = torch.cat([latents] * 2) if do_classifier_free_guidance else latents
@@ -1243,7 +1256,7 @@ def main():
                             seq_len=seq_len,
                         )
 
-                    # Optimize the denoising results only for the specified steps.
+                    # Optimize the denoising results only for the specified steps. 只在指定步骤（backprop_step_list）进行反向传播，防止无关步骤干扰模型参数更新
                     if i in backprop_step_list:
                         noise_pred = noise_pred
                     else:
@@ -1263,9 +1276,10 @@ def main():
                 # operation within the computational graph. Thus, we only decode the first args.num_decoded_latents 
                 # to calculate the reward.
                 # TODO: Decode all latents but keep a portion of the decoding operation within the computational graph.
-                sampled_latent_indices = list(range(args.num_decoded_latents))
-                sampled_latents = latents[:, :, sampled_latent_indices, :, :]
-                sampled_frames = vae.decode(sampled_latents.to(vae.device, vae.dtype))[0]
+                #sampled_latent_indices = list(range(args.num_decoded_latents))
+                #sampled_latents = latents[:, :, sampled_latent_indices, :, :]
+                #sampled_frames = vae.decode(sampled_latents.to(vae.device, vae.dtype))[0]
+                sampled_frames = vae.decode(latents.to(vae.device, vae.dtype))[0]
                 sampled_frames = sampled_frames.clamp(-1, 1)
                 sampled_frames = (sampled_frames / 2 + 0.5).clamp(0, 1)  # [-1, 1] -> [0, 1]
 
@@ -1277,17 +1291,19 @@ def main():
                         fps=8
                     )
                 
+                # 选择哪些帧用于loss计算
                 if args.num_sampled_frames is not None:
                     num_frames = sampled_frames.size(2) - 1
                     sampled_frames_indices = torch.linspace(0, num_frames, steps=args.num_sampled_frames).long()
                     sampled_frames = sampled_frames[:, :, sampled_frames_indices, :, :]
+                
                 # compute loss and reward
                 loss, reward = loss_fn(sampled_frames, train_prompt)
 
                 # Gather the losses and rewards across all processes for logging (if we use distributed training).
-                avg_loss = accelerator.gather(loss.repeat(args.train_batch_size)).mean()
-                avg_reward = accelerator.gather(reward.repeat(args.train_batch_size)).mean()
-                train_loss += avg_loss.item() / args.gradient_accumulation_steps
+                avg_loss      = accelerator.gather(loss.repeat(args.train_batch_size)).mean()
+                avg_reward    = accelerator.gather(reward.repeat(args.train_batch_size)).mean()
+                train_loss   += avg_loss.item()   / args.gradient_accumulation_steps
                 train_reward += avg_reward.item() / args.gradient_accumulation_steps
 
                 # Backpropagate
