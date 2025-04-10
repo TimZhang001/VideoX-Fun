@@ -678,7 +678,7 @@ def parse_args():
     parser.add_argument(
         "--num_decoded_latents",
         type=int,
-        default=3,
+        default=1,
         help="The number of latents to be decoded."
     )
     parser.add_argument(
@@ -1276,10 +1276,12 @@ def main():
                 # operation within the computational graph. Thus, we only decode the first args.num_decoded_latents 
                 # to calculate the reward.
                 # TODO: Decode all latents but keep a portion of the decoding operation within the computational graph.
-                #sampled_latent_indices = list(range(args.num_decoded_latents))
-                #sampled_latents = latents[:, :, sampled_latent_indices, :, :]
-                #sampled_frames = vae.decode(sampled_latents.to(vae.device, vae.dtype))[0]
-                sampled_frames = vae.decode(latents.to(vae.device, vae.dtype))[0]
+                if 1:
+                    sampled_latent_indices = list(range(args.num_decoded_latents))
+                    sampled_latents = latents[:, :, sampled_latent_indices, :, :]
+                    sampled_frames = vae.decode(sampled_latents.to(vae.device, vae.dtype))[0]
+                else:
+                    sampled_frames = vae.decode(latents.to(vae.device, vae.dtype))[0]
                 sampled_frames = sampled_frames.clamp(-1, 1)
                 sampled_frames = (sampled_frames / 2 + 0.5).clamp(0, 1)  # [-1, 1] -> [0, 1]
 

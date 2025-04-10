@@ -30,6 +30,7 @@ accelerate launch --num_processes=1 --mixed_precision="bf16" scripts/wan2.1/trai
   --num_inference_steps=40 \
   --video_length=41 \
   --num_sampled_frames=4 \
+  --num_decoded_latents=5 \
   --reward_fn="AestheticReward" \
   --reward_fn_kwargs='{"version": "v2.5", "encoder_path":"models/google/siglip-so400m-patch14-384"}' \
   --backprop_strategy "tail" \

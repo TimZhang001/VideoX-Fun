@@ -66,7 +66,7 @@ def parse_args():
     parser.add_argument("--video_length", type=int, default=81, help="视频长度（帧数）")
     parser.add_argument("--fps",          type=int, default=16, help="输出视频帧率")
     parser.add_argument("--seed",         type=int, default=43, help="随机种子")
-    parser.add_argument("--num_inference_steps", type=int, default=50, help="推理步数")
+    parser.add_argument("--num_inference_steps", type=int, default=40, help="推理步数")
     parser.add_argument("--lora_weight",  type=float, default=0.55, help="LoRA权重")
     
     parser.add_argument("--prompt_path",     type=str, default="asset/prompt/chatgpt_custom_human_activity.txt", help="生成提示语")
@@ -221,9 +221,10 @@ def main(args):
     # 动态生成输出路径
     if args.lora_path:
         lora_name = os.path.splitext(os.path.basename(args.lora_path))[0]
-        save_path = os.path.join(args.base_save_path, lora_name)
+        model_base_name = os.path.splitext(os.path.basename(args.model_name))[0]
+        save_path = os.path.join(args.base_save_path, model_base_name, lora_name)
     else:
-        save_path = os.path.join(args.base_save_path, "wan-videos-t2v-1.3B")
+        save_path = os.path.join(args.base_save_path, model_base_name, "nolora")
     os.makedirs(save_path, exist_ok=True)    
     
     # 模型加载
