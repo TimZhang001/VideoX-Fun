@@ -79,11 +79,14 @@ def save_videos_grid(videos: torch.Tensor, path: str, rescale=False, n_rows=6, f
 
 def get_image_to_video_latent(validation_image_start, validation_image_end, video_length, sample_size):
     if validation_image_start is not None and validation_image_end is not None:
+        
+        # 处理起始图像（文件路径或 PIL 图像）
         if type(validation_image_start) is str and os.path.isfile(validation_image_start):
             image_start = clip_image = Image.open(validation_image_start).convert("RGB")
             image_start = image_start.resize([sample_size[1], sample_size[0]])
             clip_image = clip_image.resize([sample_size[1], sample_size[0]])
         else:
+            # 处理图像列表（批量调整大小）
             image_start = clip_image = validation_image_start
             image_start = [_image_start.resize([sample_size[1], sample_size[0]]) for _image_start in image_start]
             clip_image = [_clip_image.resize([sample_size[1], sample_size[0]]) for _clip_image in clip_image]
@@ -95,6 +98,7 @@ def get_image_to_video_latent(validation_image_start, validation_image_end, vide
             image_end = validation_image_end
             image_end = [_image_end.resize([sample_size[1], sample_size[0]]) for _image_end in image_end]
 
+        # 构建视频张量与掩码
         if type(image_start) is list:
             clip_image = clip_image[0]
             start_video = torch.cat(

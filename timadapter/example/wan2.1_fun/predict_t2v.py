@@ -240,11 +240,13 @@ def main(args):
     config = OmegaConf.load(args.config_path)
     
     # 动态生成输出路径
+    model_base_name = os.path.basename(args.model_name)
     if args.lora_path:
         lora_name = os.path.splitext(os.path.basename(args.lora_path))[0]
-        save_path = os.path.join(args.base_save_path, lora_name)
+        save_path = os.path.join(args.base_save_path, model_base_name, lora_name)
     else:
-        save_path = os.path.join(args.base_save_path, "wan-videos-fun-t2v-1.3B")
+        save_path = os.path.join(args.base_save_path, model_base_name, "nolora")
+    print("save path is " + save_path)
     os.makedirs(save_path, exist_ok=True)    
     
     # 模型加载
