@@ -59,8 +59,6 @@ project_roots = [os.path.dirname(current_file_path), os.path.dirname(os.path.dir
 for project_root in project_roots:
     sys.path.insert(0, project_root) if project_root not in sys.path else None
 
-sys.path.append("/mnt/vision-gen-ssd/zhangss/VideoX-Fun")
-
 import videox_fun.reward.reward_fn as reward_fn
 from videox_fun.models import (AutoencoderKLWan, CLIPModel, WanT5EncoderModel,
                               WanTransformer3DModel)
