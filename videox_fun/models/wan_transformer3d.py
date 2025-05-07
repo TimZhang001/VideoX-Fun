@@ -25,6 +25,7 @@ from ..dist import (get_sequence_parallel_rank,
 from ..dist.wan_xfuser import usp_attn_forward
 from .cache_utils import TeaCache
 from .wan_camera_adapter import SimpleAdapter
+from torch.utils.checkpoint import checkpoint
 
 try:
     import flash_attn_interface
@@ -59,6 +60,25 @@ except:
     except:
         sageattn = None
         SAGE_ATTENTION_AVAILABLE = False
+
+
+def dtype_safe_checkpoint(func, *args):
+    converted_args = []
+    for arg in args:
+        if torch.is_tensor(arg):
+            converted_args.append(arg.to(torch.float32))
+        else:
+            # 允许特定参数为None并跳过转换
+            if arg is None:
+                converted_args.append(None)  # 保留None或赋予默认值
+            else:
+                try:
+                    converted_args.append(int(arg))
+                except (TypeError, ValueError):
+                    converted_args.append(0)  # 赋予默认值
+
+    result = torch.utils.checkpoint.checkpoint(func, *converted_args, use_reentrant=False)
+    return result.to(args[0].dtype) if torch.is_tensor(result) else result
 
 def flash_attention(
     q,
@@ -395,6 +415,7 @@ class WanLayerNorm(nn.LayerNorm):
         Args:
             x(Tensor): Shape [B, L, C]
         """
+        #return super().forward(x)
         return super().forward(x.float()).type_as(x)
 
 
@@ -1053,19 +1074,32 @@ class WanTransformer3DModel(ModelMixin, ConfigMixin, FromOriginalModelMixin):
                             return module(*inputs)
 
                         return custom_forward
-                    ckpt_kwargs: Dict[str, Any] = {"use_reentrant": False} if is_torch_version(">=", "1.11.0") else {}
-                    x = torch.utils.checkpoint.checkpoint(
-                        create_custom_forward(block),
-                        x,
-                        e0,
-                        seq_lens,
-                        grid_sizes,
-                        self.freqs,
-                        context,
-                        context_lens,
-                        dtype,
-                        **ckpt_kwargs,
-                    )
+                    
+                    if(1):
+                        ckpt_kwargs: Dict[str, Any] = {"use_reentrant": False} if is_torch_version(">=", "1.11.0") else {}
+                        x = torch.utils.checkpoint.checkpoint(
+                            create_custom_forward(block),
+                            x,
+                            e0,
+                            seq_lens,
+                            grid_sizes,
+                            self.freqs,
+                            context,
+                            context_lens,
+                            dtype,
+                            **ckpt_kwargs,
+                        )
+                    else:
+                        ckpt_kwargs: Dict[str, Any] = {}
+                        x = dtype_safe_checkpoint(create_custom_forward(block), x,
+                            e0,
+                            seq_lens,
+                            grid_sizes,
+                            self.freqs,
+                            context,
+                            context_lens,
+                            dtype,
+                            **ckpt_kwargs,)
                 else:
                     # arguments
                     kwargs = dict(

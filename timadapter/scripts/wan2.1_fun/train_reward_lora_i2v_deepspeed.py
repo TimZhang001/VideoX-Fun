@@ -1,4 +1,4 @@
-"""Modified from EasyAnimate/scripts/train_lora.py
+"""Modified from VideoX-Fun/scripts/wan2.1_fun/train_lora.py
 """
 #!/usr/bin/env python
 # coding=utf-8
@@ -33,185 +33,51 @@ import numpy as np
 import torch
 import torch.utils.checkpoint
 import torchvision.transforms as transforms
+import torchvision.transforms.functional as TF
 import transformers
 from accelerate import Accelerator
 from accelerate.logging import get_logger
 from accelerate.state import AcceleratorState
 from accelerate.utils import ProjectConfiguration, set_seed
-from decord import VideoReader
 from diffusers import DDIMScheduler, FlowMatchEulerDiscreteScheduler
 from diffusers.optimization import get_scheduler
 from diffusers.utils import check_min_version, is_wandb_available
+from diffusers.utils.torch_utils import is_compiled_module
+from torch.utils.tensorboard import SummaryWriter
 from diffusers.utils.import_utils import is_xformers_available
 from einops import rearrange
 from omegaconf import OmegaConf
 from packaging import version
+from PIL import Image
+from torch.utils.data import RandomSampler
 from tqdm.auto import tqdm
 from transformers import AutoTokenizer
 from transformers.utils import ContextManagers
-
+from torch.utils.data import Dataset, DataLoader, DistributedSampler
 import datasets
+import pickle
 
 current_file_path = os.path.abspath(__file__)
 project_roots = [os.path.dirname(current_file_path), os.path.dirname(os.path.dirname(current_file_path)), os.path.dirname(os.path.dirname(os.path.dirname(current_file_path)))]
 for project_root in project_roots:
     sys.path.insert(0, project_root) if project_root not in sys.path else None
 
+sys.path.append("/mnt/vision-gen-ssd/zhangss/VideoX-Fun")
+
 import videox_fun.reward.reward_fn as reward_fn
-from videox_fun.models import (AutoencoderKLWan, CLIPModel, WanT5EncoderModel,
-                              WanTransformer3DModel)
-from videox_fun.pipeline import WanPipeline, WanI2VPipeline
+from videox_fun.models import (AutoencoderKLWan, CLIPModel, WanT5EncoderModel, WanTransformer3DModel)
 from videox_fun.utils.lora_utils import create_network, merge_lora
-from videox_fun.utils.utils import get_image_to_video_latent, save_videos_grid
+from videox_fun.utils.utils import save_videos_grid
+from timadapter.tools.process_video_frames import process_video_frames
+from timadapter.tools.VideoPromptDataset import load_prompts_videos, VideoPromptDataset, PromptVideoSampler
 
 if is_wandb_available():
     import wandb
-
 
 # Will error if the minimal version of diffusers is not installed. Remove at your own risks.
 check_min_version("0.18.0.dev0")
 
 logger = get_logger(__name__, log_level="INFO")
-
-@contextmanager
-def video_reader(*args, **kwargs):
-    """A context manager to solve the memory leak of decord.
-    """
-    vr = VideoReader(*args, **kwargs)
-    try:
-        yield vr
-    finally:
-        del vr
-        gc.collect()
-
-
-def filter_kwargs(cls, kwargs):
-    import inspect
-    sig = inspect.signature(cls.__init__)
-    valid_params = set(sig.parameters.keys()) - {'self', 'cls'}
-    filtered_kwargs = {k: v for k, v in kwargs.items() if k in valid_params}
-    return filtered_kwargs
-
-
-def log_validation(
-    vae, text_encoder, tokenizer, transformer3d, network, 
-    loss_fn, config, args, accelerator, weight_dtype, global_step, validation_prompts_idx
-):
-    try:
-        logger.info("Running validation... ")
-
-        transformer3d_val = WanTransformer3DModel.from_pretrained(
-            os.path.join(args.pretrained_model_name_or_path, config['transformer_additional_kwargs'].get('transformer_subpath', 'transformer')),
-            transformer_additional_kwargs=OmegaConf.to_container(config['transformer_additional_kwargs']),
-        ).to(weight_dtype)
-        transformer3d_val.load_state_dict(accelerator.unwrap_model(transformer3d).state_dict())
-        scheduler = FlowMatchEulerDiscreteScheduler(
-            **filter_kwargs(FlowMatchEulerDiscreteScheduler, OmegaConf.to_container(config['scheduler_kwargs']))
-        )
-        # Initialize a new vae if gradient checkpointing is enabled.
-        if args.vae_gradient_checkpointing:
-            # Get Vae
-            vae = WanTransformer3DModel.from_pretrained(
-                args.pretrained_model_name_or_path, subfolder="vae", revision=args.revision, variant=args.variant
-            ).to(weight_dtype)
-
-        pipeline = WanPipeline(
-            vae=vae if args.vae_gradient_checkpointing else accelerator.unwrap_model(vae).to(weight_dtype),
-            text_encoder=accelerator.unwrap_model(text_encoder),
-            tokenizer=tokenizer,
-            transformer=transformer3d_val,
-            scheduler=scheduler,
-        )
-        pipeline = pipeline.to(dtype=weight_dtype)
-        if args.low_vram:
-            pipeline.enable_model_cpu_offload()
-        else:
-            pipeline = pipeline.to(device=accelerator.device)
-        pipeline = merge_lora(
-            pipeline, None, 1, accelerator.device, state_dict=accelerator.unwrap_model(network).state_dict(), transformer_only=True
-        )
-        to_tensor = transforms.ToTensor()
-        validation_loss, validation_reward = 0, 0
-
-        for i in range(len(validation_prompts_idx)):
-            validation_idx, validation_prompt = validation_prompts_idx[i]
-            with torch.no_grad():
-                with torch.autocast("cuda", dtype=weight_dtype):
-                    video_length = int((args.video_sample_n_frames - 1) // vae.config.temporal_compression_ratio * vae.config.temporal_compression_ratio) + 1 if args.video_sample_n_frames != 1 else 1                    
-                    sample_size = [args.validation_sample_height, args.validation_sample_width]
-                    input_video, input_video_mask, clip_image = get_image_to_video_latent(
-                        None, None, video_length=args.video_length, sample_size=sample_size
-                    )
-
-                    if args.seed is None:
-                        generator = None
-                    else:
-                        generator = torch.Generator(device=accelerator.device).manual_seed(args.seed)
-
-                    sample = pipeline(
-                        validation_prompt,
-                        video_length = video_length,
-                        negative_prompt = "bad detailed",
-                        height      = args.validation_sample_height,
-                        width       = args.validation_sample_width,
-                        guidance_scale = 6,
-                        generator   = generator,
-
-                        video        = input_video,
-                        mask_video   = input_video_mask,
-                        clip_image   = clip_image,
-                    ).frames
-                    sample_saved_path = os.path.join(args.output_dir, f"validation_sample/sample-{global_step}-{validation_idx}.mp4")
-                    save_videos_grid(sample, sample_saved_path, fps=8)
-
-                    num_sampled_frames = 4
-                    sampled_frames_list = []
-                    with video_reader(sample_saved_path) as vr:
-                        sampled_frame_idx_list = np.linspace(0, len(vr), num_sampled_frames, endpoint=False, dtype=int)
-                        sampled_frame_list = vr.get_batch(sampled_frame_idx_list).asnumpy()
-                        sampled_frames = torch.stack([to_tensor(frame) for frame in sampled_frame_list], dim=0)
-                        sampled_frames_list.append(sampled_frames)
-                    
-                    sampled_frames = torch.stack(sampled_frames_list)
-                    sampled_frames = rearrange(sampled_frames, "b t c h w -> b c t h w")
-                    loss, reward = loss_fn(sampled_frames, [validation_prompt])
-                    validation_loss, validation_reward = validation_loss + loss, validation_reward + reward
-        
-        validation_loss = validation_loss / len(validation_prompts_idx)
-        validation_reward = validation_reward / len(validation_prompts_idx)
-
-        del pipeline
-        del transformer3d_val
-        gc.collect()
-        torch.cuda.empty_cache()
-        torch.cuda.ipc_collect()
-
-        return validation_loss, validation_reward
-    except Exception as e:
-        gc.collect()
-        torch.cuda.empty_cache()
-        torch.cuda.ipc_collect()
-        print(f"Eval error with info {e}")
-        return None, None
-
-
-def load_prompts(prompt_path, prompt_column="prompt", start_idx=None, end_idx=None):
-    prompt_list = []
-    if prompt_path.endswith(".txt"):
-        with open(prompt_path, "r") as f:
-            for line in f:
-                prompt_list.append(line.strip())
-    elif prompt_path.endswith(".jsonl"):
-        with open(prompt_path, "r") as f:
-            for line in f.readlines():
-                item = json.loads(line)
-                prompt_list.append(item[prompt_column])
-    else:
-        raise ValueError("The prompt_path must end with .txt or .jsonl.")
-    prompt_list = prompt_list[start_idx:end_idx]
-
-    return prompt_list
-
 
 def _get_t5_prompt_embeds(
     tokenizer,
@@ -339,6 +205,12 @@ def encode_prompt(
 
     return prompt_embeds, negative_prompt_embeds
 
+def filter_kwargs(cls, kwargs):
+    import inspect
+    sig = inspect.signature(cls.__init__)
+    valid_params = set(sig.parameters.keys()) - {'self', 'cls'}
+    filtered_kwargs = {k: v for k, v in kwargs.items() if k in valid_params}
+    return filtered_kwargs
 
 # Modified from EasyAnimateInpaintPipeline.prepare_extra_step_kwargs
 def prepare_extra_step_kwargs(scheduler, generator, eta):
@@ -358,7 +230,6 @@ def prepare_extra_step_kwargs(scheduler, generator, eta):
     if accepts_generator:
         extra_step_kwargs["generator"] = generator
     return extra_step_kwargs
-
 
 def parse_args():
     parser = argparse.ArgumentParser(description="Simple example of a training script.")
@@ -381,37 +252,6 @@ def parse_args():
         type=str,
         default=None,
         help="Variant of the model files of the pretrained model identifier from huggingface.co/models, 'e.g.' fp16",
-    )
-    parser.add_argument(
-        "--validation_prompt_path",
-        type=str,
-        default=None,
-        help=("A set of prompts evaluated every `--validation_epochs` and logged to `--report_to`."),
-    )
-    parser.add_argument(
-        "--validation_prompts",
-        type=str,
-        default=None,
-        nargs="+",
-        help=("A set of prompts evaluated every `--validation_epochs` and logged to `--report_to`."),
-    )
-    parser.add_argument(
-        "--validation_batch_size",
-        type=int,
-        default=1,
-        help=("A set of prompts evaluated every `--validation_epochs` and logged to `--report_to`."),
-    )
-    parser.add_argument(
-        "--validation_sample_height",
-        type=int,
-        default=512,
-        help="The height of sampling videos in validation.",
-    )
-    parser.add_argument(
-        "--validation_sample_width",
-        type=int,
-        default=512,
-        help="The width of sampling videos in validation.",
     )
     parser.add_argument(
         "--output_dir",
@@ -565,21 +405,9 @@ def parse_args():
         ),
     )
     parser.add_argument(
-        "--validation_epochs",
-        type=int,
-        default=5,
-        help="Run validation every X epochs.",
-    )
-    parser.add_argument(
-        "--validation_steps",
-        type=int,
-        default=2000,
-        help="Run validation every X steps.",
-    )
-    parser.add_argument(
         "--tracker_project_name",
         type=str,
-        default="text2image-fine-tune",
+        default="image2video-rl-fine-tune",
         help=(
             "The `project_name` argument passed to Accelerator.init_trackers for"
             " more information see https://huggingface.co/docs/accelerate/v0.17.0/en/package_reference/accelerator#accelerate.Accelerator"
@@ -750,7 +578,6 @@ def parse_args():
 
     return args
 
-
 def main():
     args = parse_args()
 
@@ -764,13 +591,21 @@ def main():
 
     config = OmegaConf.load(args.config_path)
     accelerator_project_config = ProjectConfiguration(project_dir=args.output_dir, logging_dir=logging_dir)
-
     accelerator = Accelerator(
         gradient_accumulation_steps=args.gradient_accumulation_steps,
         mixed_precision=args.mixed_precision,
         log_with=args.report_to,
         project_config=accelerator_project_config,
     )
+    deepspeed_plugin = accelerator.state.deepspeed_plugin
+    if deepspeed_plugin is not None:
+        zero_stage = int(deepspeed_plugin.zero_stage)
+        print(f"Using DeepSpeed Zero stage: {zero_stage}")
+    else:
+        zero_stage = 0
+        print("DeepSpeed is not enabled.")
+    if accelerator.is_main_process:
+        writer = SummaryWriter(log_dir=logging_dir)
 
     # Make one log on every process with the configuration for debugging.
     logging.basicConfig(
@@ -787,16 +622,8 @@ def main():
         datasets.utils.logging.set_verbosity_error()
         transformers.utils.logging.set_verbosity_error()
         diffusers.utils.logging.set_verbosity_error()
-    
-    # Sanity check for validation
-    do_validation = (args.validation_prompt_path is not None or args.validation_prompts is not None)
-    if do_validation:
-        if not (os.path.exists(args.validation_prompt_path) or args.validation_prompt_path.endswith(".txt")):
-            raise ValueError("The `--validation_prompt_path` must be a txt file containing prompts.")
-        if args.validation_batch_size < accelerator.num_processes or args.validation_batch_size % accelerator.num_processes != 0:
-            raise ValueError("The `--validation_batch_size` must be divisible by the number of processes.")
-    
-    # Sanity check for validation
+
+    # Sanity check for backprop
     if args.backprop:
         if args.backprop_step_list is not None:
             logger.warning(
@@ -813,12 +640,30 @@ def main():
 
     # If passed along, set the training seed now.
     if args.seed is not None:
-        set_seed(args.seed, device_specific=True)
+        set_seed(args.seed)
+        rng = np.random.default_rng(np.random.PCG64(args.seed + accelerator.process_index))
+        torch_rng = torch.Generator(accelerator.device).manual_seed(args.seed + accelerator.process_index)
+    else:
+        rng = None
+        torch_rng = None
+    index_rng = np.random.default_rng(np.random.PCG64(43))
+    print(f"Init rng with seed {args.seed + accelerator.process_index}. Process_index is {accelerator.process_index}")
 
-    # Handle the repository creation
+    # Get RL training prompts
+    sync_path = os.path.join(args.output_dir, "processed_data.pt")
     if accelerator.is_main_process:
-        if args.output_dir is not None:
-            os.makedirs(args.output_dir, exist_ok=True)
+        prompt_list, video_list = load_prompts_videos(args.prompt_path)
+        torch.save((prompt_list, video_list), sync_path)
+    accelerator.wait_for_everyone()
+    prompt_list, video_list = torch.load(sync_path)
+
+    batch_sampler_generator = torch.Generator().manual_seed(args.seed)
+    train_dataset    = VideoPromptDataset(prompt_list, video_list, [args.train_sample_height, args.train_sample_width])
+    batch_sampler    = PromptVideoSampler(RandomSampler(train_dataset, generator=batch_sampler_generator), train_dataset, args.train_batch_size)
+    train_dataloader = torch.utils.data.DataLoader(train_dataset,batch_sampler=batch_sampler, 
+                                                   persistent_workers=True if args.dataloader_num_workers != 0 else False,
+                                                   num_workers=args.dataloader_num_workers,)
+    print(f"Number of training prompts: {len(train_dataloader)}")
 
     # For mixed precision training we cast all non-trainable weigths (vae, non-lora text_encoder and non-lora transformer3d) to half-precision
     # as these weights are only used for inference, keeping weights in full precision is not required.
@@ -829,6 +674,11 @@ def main():
     elif accelerator.mixed_precision == "bf16":
         weight_dtype = torch.bfloat16
         args.mixed_precision = accelerator.mixed_precision
+
+    # Handle the repository creation
+    if accelerator.is_main_process:
+        if args.output_dir is not None:
+            os.makedirs(args.output_dir, exist_ok=True)
 
     # Load scheduler, tokenizer and models.
     noise_scheduler = FlowMatchEulerDiscreteScheduler(
@@ -867,32 +717,31 @@ def main():
             low_cpu_mem_usage=True,
             torch_dtype=weight_dtype,
         )
-        text_encoder = text_encoder.eval()
+        text_encoder.eval()
         # Get Vae
         vae = AutoencoderKLWan.from_pretrained(
             os.path.join(args.pretrained_model_name_or_path, config['vae_kwargs'].get('vae_subpath', 'vae')),
             additional_kwargs=OmegaConf.to_container(config['vae_kwargs']),
         )
+        vae.eval()
 
     # Get Transformer
     transformer3d = WanTransformer3DModel.from_pretrained(
         os.path.join(args.pretrained_model_name_or_path, config['transformer_additional_kwargs'].get('transformer_subpath', 'transformer')),
         transformer_additional_kwargs=OmegaConf.to_container(config['transformer_additional_kwargs']),
-    )
+    ).to(weight_dtype)
 
-    # if args.train_mode != "normal":
-    #     # Get Clip Image Encoder
-    #     clip_image_encoder = CLIPModel.from_pretrained(
-    #         os.path.join(args.pretrained_model_name_or_path, config['image_encoder_kwargs'].get('image_encoder_subpath', 'image_encoder')),
-    #     )
-    #     clip_image_encoder = clip_image_encoder.eval()
+    # Get Clip Image Encoder
+    clip_image_encoder = CLIPModel.from_pretrained(
+        os.path.join(args.pretrained_model_name_or_path, config['image_encoder_kwargs'].get('image_encoder_subpath', 'image_encoder')),
+    )
+    clip_image_encoder.eval()
 
     # Freeze vae and text_encoder and set transformer3d to trainable
     vae.requires_grad_(False)
-    vae.eval()
     text_encoder.requires_grad_(False)
     transformer3d.requires_grad_(False)
-    # clip_image_encoder.requires_grad_(False)
+    clip_image_encoder.requires_grad_(False)
 
     # Lora will work with this...
     network = create_network(
@@ -918,6 +767,7 @@ def main():
 
         m, u = transformer3d.load_state_dict(state_dict, strict=False)
         print(f"missing keys: {len(m)}, unexpected keys: {len(u)}")
+        assert len(u) == 0
 
     if args.vae_path is not None:
         print(f"From checkpoint: {args.vae_path}")
@@ -930,29 +780,52 @@ def main():
 
         m, u = vae.load_state_dict(state_dict, strict=False)
         print(f"missing keys: {len(m)}, unexpected keys: {len(u)}")
+        assert len(u) == 0
 
     # `accelerate` 0.16.0 will have better support for customized saving
     if version.parse(accelerate.__version__) >= version.parse("0.16.0"):
         # create custom saving & loading hooks so that `accelerator.save_state(...)` serializes in a nice format
-        def save_model_hook(models, weights, output_dir):
-            if accelerator.is_main_process:
-                safetensor_save_path = os.path.join(output_dir, f"lora_diffusion_pytorch_model.safetensors")
-                save_model(safetensor_save_path, accelerator.unwrap_model(models[-1]))
+        if zero_stage != 3:
+            def save_model_hook(models, weights, output_dir):
+                if accelerator.is_main_process:
+                    safetensor_save_path = os.path.join(output_dir, 
+                                                        f"lora_diffusion_pytorch_model.safetensors")
+                    save_model(safetensor_save_path, accelerator.unwrap_model(models[-1]))
+                    if not args.use_deepspeed:
+                        for _ in range(len(weights)):
+                            weights.pop()
 
+                    with open(os.path.join(output_dir, "sampler_pos_start.pkl"), 'wb') as file:
+                        pickle.dump([batch_sampler.sampler._pos_start, first_epoch], file)
+            
+            def load_model_hook(models, input_dir):
+                pkl_path = os.path.join(input_dir, "sampler_pos_start.pkl")
+                if os.path.exists(pkl_path):
+                    with open(pkl_path, 'rb') as file:
+                        loaded_number, _ = pickle.load(file)
+                        batch_sampler.sampler._pos_start = max(loaded_number - args.dataloader_num_workers * accelerator.num_processes * 2, 0)
+                    print(f"Load pkl from {pkl_path}. Get loaded_number = {loaded_number}.")
+        else:
+            def save_model_hook(models, weights, output_dir):
+                if accelerator.is_main_process:
+                    with open(os.path.join(output_dir, "sampler_pos_start.pkl"), 'wb') as file:
+                        pickle.dump([batch_sampler.sampler._pos_start, first_epoch], file)
+
+            def load_model_hook(models, input_dir):
+                pkl_path = os.path.join(input_dir, "sampler_pos_start.pkl")
+                if os.path.exists(pkl_path):
+                    with open(pkl_path, 'rb') as file:
+                        loaded_number, _ = pickle.load(file)
+                        batch_sampler.sampler._pos_start = max(loaded_number - args.dataloader_num_workers * accelerator.num_processes * 2, 0)
+                    print(f"Load pkl from {pkl_path}. Get loaded_number = {loaded_number}.")
+                
         accelerator.register_save_state_pre_hook(save_model_hook)
-        # Save the model weights directly before save_state instead of using a hook.
-        # accelerator.register_load_state_pre_hook(load_model_hook)
+        accelerator.register_load_state_pre_hook(load_model_hook)
 
     if args.gradient_checkpointing:
         transformer3d.enable_gradient_checkpointing()
     
     if args.vae_gradient_checkpointing:
-        # Since 3D casual VAE need a cache to decode all latents autoregressively, .Thus, gradient checkpointing can only be 
-        # enabled when decoding the first batch (i.e. the first three) of latents, in which case the cache is not being used.
-        
-        # num_decoded_latents > 3 is support in EasyAnimate now.
-        # if args.num_decoded_latents > 3:
-        #     raise ValueError("The vae_gradient_checkpointing is not supported for num_decoded_latents > 3.")
         vae.enable_gradient_checkpointing()
 
     # Enable TF32 for faster training on Ampere GPUs,
@@ -1013,17 +886,13 @@ def main():
     if args.reward_fn_kwargs is not None:
         reward_fn_kwargs = json.loads(args.reward_fn_kwargs)
     if accelerator.is_main_process:
-        # Check if the model is downloaded in the main process.
         loss_fn = getattr(reward_fn, args.reward_fn)(device="cpu", dtype=weight_dtype, **reward_fn_kwargs)
     accelerator.wait_for_everyone()
     loss_fn = getattr(reward_fn, args.reward_fn)(device=accelerator.device, dtype=weight_dtype, **reward_fn_kwargs)
 
-    # Get RL training prompts
-    prompt_list = load_prompts(args.prompt_path)
-
     # Scheduler and math around the number of training steps.
     overrode_max_train_steps = False
-    num_update_steps_per_epoch = math.ceil(len(prompt_list) / args.gradient_accumulation_steps)
+    num_update_steps_per_epoch = math.ceil(len(train_dataloader) / args.gradient_accumulation_steps)
     if args.max_train_steps is None:
         args.max_train_steps = args.num_train_epochs * num_update_steps_per_epoch
         overrode_max_train_steps = True
@@ -1036,12 +905,13 @@ def main():
     )
 
     # Prepare everything with our `accelerator`.
-    network, optimizer, lr_scheduler = accelerator.prepare(network, optimizer, lr_scheduler)
+    network, optimizer, train_dataloader, lr_scheduler = accelerator.prepare(network, optimizer, train_dataloader, lr_scheduler)
 
     # Move text_encode and vae to gpu and cast to weight_dtype
     vae.to(accelerator.device, dtype=weight_dtype)
     transformer3d.to(accelerator.device, dtype=weight_dtype)
     text_encoder.to(accelerator.device)
+    clip_image_encoder.to(accelerator.device, dtype=weight_dtype)
     
     # We need to recalculate our total training steps as the size of the training dataloader may have changed.
     num_update_steps_per_epoch = math.ceil(len(prompt_list) / args.gradient_accumulation_steps)
@@ -1054,9 +924,14 @@ def main():
     # The trackers initializes automatically on the main process.
     if accelerator.is_main_process:
         tracker_config = dict(vars(args))
-        tracker_config.pop("validation_prompts")
         tracker_config.pop("backprop_step_list", None)
         accelerator.init_trackers(args.tracker_project_name, tracker_config)
+
+    # Function for unwrapping if model was compiled with `torch.compile`.
+    def unwrap_model(model):
+        model = accelerator.unwrap_model(model)
+        model = model._orig_mod if is_compiled_module(model) else model
+        return model
 
     # Train!
     total_batch_size = args.train_batch_size * accelerator.num_processes * args.gradient_accumulation_steps
@@ -1093,6 +968,14 @@ def main():
 
             initial_global_step = global_step
 
+            pkl_path = os.path.join(os.path.join(args.output_dir, path), "sampler_pos_start.pkl")
+            if os.path.exists(pkl_path):
+                with open(pkl_path, 'rb') as file:
+                    _, first_epoch = pickle.load(file)
+            else:
+                first_epoch = global_step // num_update_steps_per_epoch
+            print(f"Load pkl from {pkl_path}. Get first_epoch = {first_epoch}.")
+
             from safetensors.torch import load_file, safe_open
             state_dict = load_file(os.path.join(os.path.join(args.output_dir, path), "lora_diffusion_pytorch_model.safetensors"))
             m, u = accelerator.unwrap_model(network).load_state_dict(state_dict, strict=False)
@@ -1117,22 +1000,22 @@ def main():
         disable=not accelerator.is_local_main_process,
     )
 
-    # -------------------------------------- epoch --------------------------------------------------
     for epoch in range(first_epoch, args.num_train_epochs):
         train_loss = 0.0
         train_reward = 0.0
+        batch_sampler.sampler.generator = torch.Generator().manual_seed(args.seed + epoch)
 
         # In the following training loop, randomly select training prompts and use the 
-        # `EasyAnimatePipelineInpaint` to sample videos, calculate rewards, and update the network.
-        # ------------------------------------- step ---------------------------------------------
-        for _ in range(num_update_steps_per_epoch):
-            # train_prompt = random.sample(prompt_list, args.train_batch_size)
-            train_prompt = random.choices(prompt_list, k=args.train_batch_size)
+        for step, batch in enumerate(train_dataloader):
+            train_prompt     = batch["prompt"]
+            train_video_path = batch["video_path"]
+            train_images     = batch["image_frame"]
             logger.info(f"train_prompt: {train_prompt}")
-
+            logger.info(f"train_video:  {train_video_path}")
+            
             # default height and width
             height = int(args.train_sample_height // 16 * 16)
-            width = int(args.train_sample_width // 16 * 16)
+            width  = int(args.train_sample_width  // 16 * 16)
             
             # here `guidance_scale` is defined analog to the guidance weight `w` of equation (2)
             # of the Imagen paper: https://arxiv.org/pdf/2205.11487.pdf . `guidance_scale = 1`
@@ -1143,6 +1026,8 @@ def main():
             if args.low_vram:
                 torch.cuda.empty_cache()
                 text_encoder.to(accelerator.device)
+                #vae.to(accelerator.device)
+                #clip_image_encoder.to(accelerator.device)
 
             # Encode input prompt
             (
@@ -1183,13 +1068,30 @@ def main():
             ]
 
             with accelerator.accumulate(transformer3d):
-                
-                # ------------------- 在latent空间设定noise -------------------
                 latents = torch.randn(*latent_shape, device=accelerator.device, dtype=weight_dtype)
+
+                # Prepare inpaint latents if it needs.
+                # Use zero latents if we want to t2v.
+                mask_latents         = torch.zeros_like(latents)[:, :4].to(latents.device, latents.dtype)
+                masked_video_latents = torch.zeros_like(latents).to(latents.device, latents.dtype)
+
+                mask_input = torch.cat([mask_latents] * 2) if do_classifier_free_guidance else mask_latents
+                masked_video_latents_input = (torch.cat([masked_video_latents] * 2) if do_classifier_free_guidance else masked_video_latents)
+                inpaint_latents = torch.cat([mask_input, masked_video_latents_input], dim=1).to(latents.dtype)
 
                 if hasattr(noise_scheduler, "init_noise_sigma"):
                     latents = latents * noise_scheduler.init_noise_sigma
 
+                clip_context = []
+                for index in range(args.train_batch_size):
+                    clip_image    = train_images[index].sub_(0.5).div_(0.5).to(latents.device, latents.dtype)
+                    _clip_context = clip_image_encoder([clip_image[:, None, :, :]])
+                    zero_init_clip_in = np.random.choice([True, False], p=[0.1, 0.9])
+                    clip_context.append(_clip_context if not zero_init_clip_in else torch.zeros_like(_clip_context))
+                            
+                clip_context = torch.cat(clip_context)
+                clip_context = ( torch.cat([clip_context] * 2) if do_classifier_free_guidance else clip_context)
+                
                 generator = torch.Generator(device=accelerator.device).manual_seed(args.seed)
                 # Prepare extra step kwargs.
                 extra_step_kwargs = prepare_extra_step_kwargs(noise_scheduler, generator, args.eta)
@@ -1202,25 +1104,17 @@ def main():
                     target_shape[1]
                 )
 
-                # Denoising loop 选择需要进行Reward计算的DeNoise步数(越多 对于内存消耗越多) ----------------------------------
+                # Denoising loop
                 if args.backprop:
                     if args.backprop_step_list is None:
-
-                        # 选择最后一步的结果
                         if args.backprop_strategy == "last":
                             backprop_step_list = [args.num_inference_steps - 1]
-                        
-                        # 选择最后的backprop_num_steps个
                         elif args.backprop_strategy == "tail":
                             backprop_step_list = list(range(args.num_inference_steps))[-args.backprop_num_steps:]
-                        
-                        # 从0, num_inference_steps 均匀的选择backprop_num_steps个
                         elif args.backprop_strategy == "uniform":
                             interval = args.num_inference_steps // args.backprop_num_steps
                             random_start = random.randint(0, interval)
                             backprop_step_list = [random_start + i * interval for i in range(args.backprop_num_steps)]
-                        
-                        # 从backprop_random_start_step 到 backprop_random_end_step随机选择backprop_num_steps个
                         elif args.backprop_strategy == "random":
                             backprop_step_list = random.sample(
                                 range(args.backprop_random_start_step, args.backprop_random_end_step + 1), args.backprop_num_steps
@@ -1230,7 +1124,6 @@ def main():
                     else:
                         backprop_step_list = args.backprop_step_list
                 
-                # ------------------------------------------------------------------------------------------
                 for i, t in enumerate(tqdm(timesteps)):
                     # expand the latents if we are doing classifier free guidance
                     latent_model_input = torch.cat([latents] * 2) if do_classifier_free_guidance else latents
@@ -1242,9 +1135,8 @@ def main():
                         dtype=latent_model_input.dtype
                     )
 
-                    # predict the noise residual
+                    # Whether to enable DRTune: https://arxiv.org/abs/2405.00760
                     if args.stop_latent_model_input_gradient:
-                        # See https://arxiv.org/abs/2405.00760
                         latent_model_input = latent_model_input.detach()
 
                     # predict noise model_output
@@ -1254,9 +1146,11 @@ def main():
                             context=prompt_embeds,
                             t=t_expand,
                             seq_len=seq_len,
+                            y=inpaint_latents,
+                            clip_fea=clip_context
                         )
 
-                    # Optimize the denoising results only for the specified steps. 只在指定步骤（backprop_step_list）进行反向传播，防止无关步骤干扰模型参数更新
+                    # Optimize the denoising results only for the specified steps.
                     if i in backprop_step_list:
                         noise_pred = noise_pred
                     else:
@@ -1278,30 +1172,28 @@ def main():
                 # TODO: Decode all latents but keep a portion of the decoding operation within the computational graph.
                 sampled_latent_indices = list(range(args.num_decoded_latents))
                 sampled_latents = latents[:, :, sampled_latent_indices, :, :]
-                sampled_frames = vae.decode(sampled_latents.to(vae.device, vae.dtype))[0]
+                sampled_frames = vae.decode(sampled_latents.to(vae.device, vae.dtype)).sample
                 sampled_frames = sampled_frames.clamp(-1, 1)
                 sampled_frames = (sampled_frames / 2 + 0.5).clamp(0, 1)  # [-1, 1] -> [0, 1]
 
                 if global_step % args.checkpointing_steps == 0:
                     saved_file = f"sample-{global_step}-{accelerator.process_index}.mp4"
-                    save_videos_grid(
-                        sampled_frames.to(torch.float32).detach().cpu(),
-                        os.path.join(args.output_dir, "train_sample", saved_file),
-                        fps=8
-                    )
+                    save_videos_grid(sampled_frames.to(torch.float32).detach().cpu(),
+                                     os.path.join(args.output_dir, "train_sample", saved_file), fps=8)
+                    image_frame = process_video_frames(train_video_path[0], [args.train_sample_height, args.train_sample_width])
+                    image_frame.save(os.path.join(args.output_dir, "train_sample", f"train_images_{global_step}.png"))
                 
-                # 选择哪些帧用于loss计算
                 if args.num_sampled_frames is not None:
-                    num_frames = sampled_frames.size(2) - 1
+                    num_frames     = sampled_frames.size(2) - 1
                     sampled_frames_indices = torch.linspace(0, num_frames, steps=args.num_sampled_frames).long()
                     sampled_frames = sampled_frames[:, :, sampled_frames_indices, :, :]
                 
                 # compute loss and reward
-                loss, reward = loss_fn(sampled_frames, train_prompt)
+                loss, reward   = loss_fn(sampled_frames, train_prompt)
 
                 # Gather the losses and rewards across all processes for logging (if we use distributed training).
-                avg_loss      = accelerator.gather(loss.repeat(args.train_batch_size)).mean()
-                avg_reward    = accelerator.gather(reward.repeat(args.train_batch_size)).mean()
+                avg_loss     = accelerator.gather(loss.repeat(args.train_batch_size)).mean()
+                avg_reward   = accelerator.gather(reward.repeat(args.train_batch_size)).mean()
                 train_loss   += avg_loss.item()   / args.gradient_accumulation_steps
                 train_reward += avg_reward.item() / args.gradient_accumulation_steps
 
@@ -1358,53 +1250,25 @@ def main():
                             accelerator_save_path = os.path.join(args.output_dir, f"checkpoint-{global_step}")
                             accelerator.save_state(accelerator_save_path)
                             logger.info(f"Saved state to {accelerator_save_path}")
-                
-                # Validation (distributed)
-                if do_validation and (global_step % args.validation_steps) == 0:
-                    if args.validation_prompts is None and args.validation_prompt_path.endswith(".txt"):
-                        validation_prompts = []
-                        with open(args.validation_prompt_path, "r") as f:
-                            for line in f:
-                                validation_prompts.append(line.strip())
-                        # Do not select randomly to ensure that `args.validation_prompts` is the same for each process.
-                        args.validation_prompts = validation_prompts[:args.validation_batch_size]
-                    validation_prompts_idx = [(i, p) for i, p in enumerate(args.validation_prompts)]
-
-                    if hasattr(vae, "enable_cache_in_vae"):
-                        vae.enable_cache_in_vae()
-                    accelerator.wait_for_everyone()
-                    with accelerator.split_between_processes(validation_prompts_idx) as splitted_prompts_idx:
-                        validation_loss, validation_reward = log_validation(
-                            vae,
-                            text_encoder,
-                            tokenizer,
-                            transformer3d,
-                            network,
-                            loss_fn,
-                            config,
-                            args,
-                            accelerator,
-                            weight_dtype,
-                            global_step,
-                            splitted_prompts_idx
-                        )
-                        if validation_loss is not None and validation_reward is not None:
-                            avg_validation_loss = accelerator.gather(validation_loss).mean()
-                            avg_validation_reward = accelerator.gather(validation_reward).mean()
-                            accelerator.print(avg_validation_loss, avg_validation_reward)
-                            if accelerator.is_main_process:
-                                accelerator.log(
-                                    {"validation_loss": avg_validation_loss, "validation_reward": avg_validation_reward},
-                                    step=global_step
-                                )
-                    
-                    accelerator.wait_for_everyone()
             
             logs = {"step_loss": loss.detach().item(), "step_reward": reward.detach().item(), "lr": lr_scheduler.get_last_lr()[0]}
             progress_bar.set_postfix(**logs)
             
             if global_step >= args.max_train_steps:
                 break
+    
+    # Create the pipeline using the trained modules and save it.
+    accelerator.wait_for_everyone()
+    if accelerator.is_main_process:
+        safetensor_save_path = os.path.join(args.output_dir, f"checkpoint-{global_step}.safetensors")
+        accelerator_save_path = os.path.join(args.output_dir, f"checkpoint-{global_step}")
+        save_model(safetensor_save_path, accelerator.unwrap_model(network))
+        if args.save_state:
+            accelerator.save_state(accelerator_save_path)
+        logger.info(f"Saved state to {accelerator_save_path}")
+
+    accelerator.end_training()
+    logger.info("Training completed.")
 
 if __name__ == "__main__":
     main()
