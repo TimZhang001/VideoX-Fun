@@ -1148,7 +1148,7 @@ def main():
 
                 if global_step % args.checkpointing_steps == 0:
                     saved_file = f"sample-{global_step}-{accelerator.process_index}.mp4"
-                    save_videos_grid(sampled_frames.to(torch.float32).detach().cpu().numpy(),
+                    save_videos_grid(sampled_frames.to(torch.float32).detach().cpu(),
                                      os.path.join(args.output_dir, "train_sample", saved_file), fps=16)
                     train_images[0].save(os.path.join(args.output_dir, "train_sample", f"train_images_{global_step}.png"))
                 
