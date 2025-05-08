@@ -87,7 +87,7 @@ def parse_args():
     # 输出配置
     parser.add_argument("--base_save_path",  type=str, default="samples", help="输出基础路径")
     
-    parser.set_defaults(enable_teacache=True)
+    #parser.set_defaults(enable_teacache=True)
     return parser.parse_args()
 
 def save_results(sample, save_path, video_length, fps, sample_num):

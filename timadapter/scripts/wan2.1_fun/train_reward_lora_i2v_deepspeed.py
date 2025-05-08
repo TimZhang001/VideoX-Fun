@@ -31,8 +31,6 @@ import accelerate
 import diffusers
 import numpy as np
 import torch
-import torch.utils.checkpoint
-import torchvision.transforms as transforms
 import torchvision.transforms.functional as TF
 import transformers
 from accelerate import Accelerator
@@ -48,12 +46,10 @@ from diffusers.utils.import_utils import is_xformers_available
 from einops import rearrange
 from omegaconf import OmegaConf
 from packaging import version
-from PIL import Image
 from torch.utils.data import RandomSampler
 from tqdm.auto import tqdm
 from transformers import AutoTokenizer
 from transformers.utils import ContextManagers
-from torch.utils.data import Dataset, DataLoader, DistributedSampler
 import datasets
 import pickle
 
@@ -439,18 +435,6 @@ def parse_args():
             "The config of the model in training."
         ),
     )
-    parser.add_argument(
-        "--transformer_path",
-        type=str,
-        default=None,
-        help=("If you want to load the weight from other transformers, input its path."),
-    )
-    parser.add_argument(
-        "--vae_path",
-        type=str,
-        default=None,
-        help=("If you want to load the weight from other vaes, input its path."),
-    )
     parser.add_argument("--save_state", action="store_true", help="Whether or not to save state.")
 
     parser.add_argument(
@@ -641,12 +625,6 @@ def main():
     # If passed along, set the training seed now.
     if args.seed is not None:
         set_seed(args.seed)
-        rng = np.random.default_rng(np.random.PCG64(args.seed + accelerator.process_index))
-        torch_rng = torch.Generator(accelerator.device).manual_seed(args.seed + accelerator.process_index)
-    else:
-        rng = None
-        torch_rng = None
-    index_rng = np.random.default_rng(np.random.PCG64(43))
     print(f"Init rng with seed {args.seed + accelerator.process_index}. Process_index is {accelerator.process_index}")
 
     # Get RL training prompts
@@ -657,12 +635,12 @@ def main():
     accelerator.wait_for_everyone()
     prompt_list, video_list = torch.load(sync_path)
 
-    batch_sampler_generator = torch.Generator().manual_seed(args.seed)
-    train_dataset    = VideoPromptDataset(prompt_list, video_list, [args.train_sample_height, args.train_sample_width])
-    batch_sampler    = PromptVideoSampler(RandomSampler(train_dataset, generator=batch_sampler_generator), train_dataset, args.train_batch_size)
-    train_dataloader = torch.utils.data.DataLoader(train_dataset,batch_sampler=batch_sampler, 
-                                                   persistent_workers=True if args.dataloader_num_workers != 0 else False,
-                                                   num_workers=args.dataloader_num_workers,)
+    sampler_generator = torch.Generator().manual_seed(args.seed)
+    train_dataset     = VideoPromptDataset(prompt_list, video_list, [args.train_sample_height, args.train_sample_width])
+    batch_sampler     = PromptVideoSampler(RandomSampler(train_dataset, generator=sampler_generator), train_dataset, args.train_batch_size)
+    train_dataloader  = torch.utils.data.DataLoader(train_dataset,batch_sampler=batch_sampler, 
+                                                    persistent_workers=True if args.dataloader_num_workers != 0 else False,
+                                                    num_workers=args.dataloader_num_workers,)
     print(f"Number of training prompts: {len(train_dataloader)}")
 
     # For mixed precision training we cast all non-trainable weigths (vae, non-lora text_encoder and non-lora transformer3d) to half-precision
@@ -754,33 +732,6 @@ def main():
         add_lora_in_attn_temporal=True,
     )
     network.apply_to(text_encoder, transformer3d, args.train_text_encoder and not args.training_with_video_token_length, True)
-
-    # Load transformer and vae from path if it needs.
-    if args.transformer_path is not None:
-        print(f"From checkpoint: {args.transformer_path}")
-        if args.transformer_path.endswith("safetensors"):
-            from safetensors.torch import load_file, safe_open
-            state_dict = load_file(args.transformer_path)
-        else:
-            state_dict = torch.load(args.transformer_path, map_location="cpu")
-        state_dict = state_dict["state_dict"] if "state_dict" in state_dict else state_dict
-
-        m, u = transformer3d.load_state_dict(state_dict, strict=False)
-        print(f"missing keys: {len(m)}, unexpected keys: {len(u)}")
-        assert len(u) == 0
-
-    if args.vae_path is not None:
-        print(f"From checkpoint: {args.vae_path}")
-        if args.vae_path.endswith("safetensors"):
-            from safetensors.torch import load_file, safe_open
-            state_dict = load_file(args.vae_path)
-        else:
-            state_dict = torch.load(args.vae_path, map_location="cpu")
-        state_dict = state_dict["state_dict"] if "state_dict" in state_dict else state_dict
-
-        m, u = vae.load_state_dict(state_dict, strict=False)
-        print(f"missing keys: {len(m)}, unexpected keys: {len(u)}")
-        assert len(u) == 0
 
     # `accelerate` 0.16.0 will have better support for customized saving
     if version.parse(accelerate.__version__) >= version.parse("0.16.0"):
@@ -926,12 +877,6 @@ def main():
         tracker_config = dict(vars(args))
         tracker_config.pop("backprop_step_list", None)
         accelerator.init_trackers(args.tracker_project_name, tracker_config)
-
-    # Function for unwrapping if model was compiled with `torch.compile`.
-    def unwrap_model(model):
-        model = accelerator.unwrap_model(model)
-        model = model._orig_mod if is_compiled_module(model) else model
-        return model
 
     # Train!
     total_batch_size = args.train_batch_size * accelerator.num_processes * args.gradient_accumulation_steps

@@ -35,7 +35,7 @@ accelerate launch --num_processes=1 --mixed_precision=$DATATYPE timadapter/scrip
   --reward_fn_kwargs='{"version": "v2.1"}' \
   --backprop_strategy "tail" \
   --backprop_num_steps $BACKPROP_NUM_STEPS \
-  --backprop 
-  #--report_to wandb \
-  #--tracker_project_name="$MODEL_NAME"
-  #--vae_gradient_checkpointing 
+  --backprop \
+  --save_state \
+  --tracker_project_name "i2v-$MODEL_NAME-fine-tune" \
+  --report_to wandb 

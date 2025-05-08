@@ -39,8 +39,7 @@ def parse_args():
     # GPU和内存配置
     parser.add_argument("--GPU_memory_mode", type=str, default="model_full_load",
                        choices=["model_full_load", "model_cpu_offload", 
-                               "model_cpu_offload_and_qfloat8", "sequential_cpu_offload"],
-                       help="GPU内存优化模式")
+                               "model_cpu_offload_and_qfloat8", "sequential_cpu_offload"], help="GPU内存优化模式")
     # # Multi GPUs config
     # Please ensure that the product of ulysses_degree and ring_degree equals the number of GPUs used. For example, if you are using 8 GPUs, you can set ulysses_degree = 2 and ring_degree = 4.
     # If you are using 1 GPU, you can set ulysses_degree = 1 and ring_degree = 1.
@@ -67,7 +66,6 @@ def parse_args():
     # 模型路径
     parser.add_argument("--config_path", type=str, default="config/wan2.1/wan_civitai.yaml", help="配置文件路径")
     parser.add_argument("--model_name",  type=str, default="models/Diffusion_Transformer/Wan2.1-Fun-1.3B-InP", help="主模型路径")
-    parser.add_argument("--transformer_path", type=str, default=None, help="Transformer检查点路径")
     parser.add_argument("--vae_path",    type=str, default=None, help="VAE检查点路径")
     parser.add_argument("--lora_path",   type=str, default=None, help="LoRA模型路径")
     
@@ -89,7 +87,7 @@ def parse_args():
     # 输出配置
     parser.add_argument("--base_save_path",  type=str, default="samples", help="输出基础路径")
     
-    parser.set_defaults(enable_teacache=True)
+    #parser.set_defaults(enable_teacache=True)
     return parser.parse_args()
 
 def save_results(sample, save_path, video_length, fps, sample_num):
@@ -119,35 +117,11 @@ def load_model(args, config, device):
         low_cpu_mem_usage=True,
         torch_dtype=weight_dtype,)
 
-    if args.transformer_path is not None:
-        print(f"From checkpoint: {args.transformer_path}")
-        if args.transformer_path.endswith("safetensors"):
-            from safetensors.torch import load_file, safe_open
-            state_dict = load_file(args.transformer_path)
-        else:
-            state_dict = torch.load(args.transformer_path, map_location="cpu")
-        state_dict = state_dict["state_dict"] if "state_dict" in state_dict else state_dict
-
-        m, u = transformer.load_state_dict(state_dict, strict=False)
-        print(f"missing keys: {len(m)}, unexpected keys: {len(u)}")
-
     # Get Vae
     vae = AutoencoderKLWan.from_pretrained(
         os.path.join(args.model_name, config['vae_kwargs'].get('vae_subpath', 'vae')),
         additional_kwargs=OmegaConf.to_container(config['vae_kwargs']),
     ).to(weight_dtype)
-
-    if args.vae_path is not None:
-        print(f"From checkpoint: {args.vae_path}")
-        if args.vae_path.endswith("safetensors"):
-            from safetensors.torch import load_file, safe_open
-            state_dict = load_file(args.vae_path)
-        else:
-            state_dict = torch.load(args.vae_path, map_location="cpu")
-        state_dict = state_dict["state_dict"] if "state_dict" in state_dict else state_dict
-
-        m, u = vae.load_state_dict(state_dict, strict=False)
-        print(f"missing keys: {len(m)}, unexpected keys: {len(u)}")
 
     # Get Tokenizer
     tokenizer = AutoTokenizer.from_pretrained(

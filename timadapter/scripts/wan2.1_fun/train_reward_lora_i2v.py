@@ -753,31 +753,6 @@ def main():
     )
     network.apply_to(text_encoder, transformer3d, args.train_text_encoder and not args.training_with_video_token_length, True)
 
-    # Load transformer and vae from path if it needs.
-    if args.transformer_path is not None:
-        print(f"From checkpoint: {args.transformer_path}")
-        if args.transformer_path.endswith("safetensors"):
-            from safetensors.torch import load_file, safe_open
-            state_dict = load_file(args.transformer_path)
-        else:
-            state_dict = torch.load(args.transformer_path, map_location="cpu")
-        state_dict = state_dict["state_dict"] if "state_dict" in state_dict else state_dict
-
-        m, u = transformer3d.load_state_dict(state_dict, strict=False)
-        print(f"missing keys: {len(m)}, unexpected keys: {len(u)}")
-
-    if args.vae_path is not None:
-        print(f"From checkpoint: {args.vae_path}")
-        if args.vae_path.endswith("safetensors"):
-            from safetensors.torch import load_file, safe_open
-            state_dict = load_file(args.vae_path)
-        else:
-            state_dict = torch.load(args.vae_path, map_location="cpu")
-        state_dict = state_dict["state_dict"] if "state_dict" in state_dict else state_dict
-
-        m, u = vae.load_state_dict(state_dict, strict=False)
-        print(f"missing keys: {len(m)}, unexpected keys: {len(u)}")
-
     # `accelerate` 0.16.0 will have better support for customized saving
     if version.parse(accelerate.__version__) >= version.parse("0.16.0"):
         # create custom saving & loading hooks so that `accelerator.save_state(...)` serializes in a nice format
