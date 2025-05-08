@@ -41,5 +41,5 @@ accelerate launch --zero_stage 3 --zero3_save_16bit_model true --zero3_init_flag
    --backprop \
    --use_deepspeed \
    --low_vram 
-   #--tracker_project_name "image2video-14B-fun-rl-fine-tune" \
-   #--report_to wandb 
+   --tracker_project_name "i2v-$MODEL_NAME-fine-tune" \
+   --report_to wandb 

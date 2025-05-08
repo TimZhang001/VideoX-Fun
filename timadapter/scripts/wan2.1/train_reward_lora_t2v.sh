@@ -7,7 +7,7 @@ export DATATYPE="bf16" # bf16, fp16, no
 
 accelerate launch --num_processes=1 --mixed_precision=$DATATYPE scripts/wan2.1/train_reward_lora.py \
   --config_path="config/wan2.1/wan_civitai.yaml" \
-  --pretrained_model_name_or_path=$MODEL_NAME \
+  --pretrained_model_name_or_path=$MODEL_PATH \
   --rank=32 \
   --network_alpha=16 \
   --train_batch_size=1 \
